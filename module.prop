@@ -1,0 +1,6 @@
+id=vpn-gateway
+name=VPN Gateway
+version=1.0
+versionCode=1
+author=Kr328
+description=Allow all LAN traffic routing to VPN.
