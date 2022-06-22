@@ -106,6 +106,12 @@ if [[ ! -z "$tun_table_index" ]]; then
     setup $TUN_NAME $tun_table_index
 fi
 
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 0 > /dev/ip_forward_stub
+chown $(stat -c '%u:%g' /data/misc/net/rt_tables) /dev/ip_forward_stub
+chcon $(stat -Z -c '%C' /data/misc/net/rt_tables) /dev/ip_forward_stub
+mount -o bind /dev/ip_forward_stub /proc/sys/net/ipv4/ip_forward
+
 inotifyd - /data/misc/net::w | while read -r event; do
     sleep 1
 
@@ -120,9 +126,5 @@ inotifyd - /data/misc/net::w | while read -r event; do
         if [[ ! -z "$tun_table_index" ]]; then
             setup $TUN_NAME $tun_table_index
         fi
-    fi
-
-    if [[ ! -z "$tun_table_index" ]]; then
-        echo 1 >/proc/sys/net/ipv4/ip_forward
     fi
 done
