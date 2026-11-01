@@ -14,6 +14,40 @@ SRC_V4="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 # a delegated global prefix). Link-local / multicast are never marked.
 SRC_V6="fc00::/7 2000::/3"
 
+# Destinations that are never sent into the tun (intranet / special-use).
+# Same lists as the Magic V2Ray service. Both the mangle chain (no mark) and
+# policy routing (`to <cidr> lookup main`) use them.
+LAN_BYPASS_V4="
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.0.0.0/24
+192.0.2.0/24
+192.88.99.0/24
+192.168.0.0/16
+198.51.100.0/24
+203.0.113.0/24
+224.0.0.0/4
+240.0.0.0/4
+255.255.255.255/32
+"
+LAN_BYPASS_V6="
+::1/128
+::ffff:0:0/96
+64:ff9b::/96
+100::/64
+2001::/32
+2001:10::/28
+2001:20::/28
+2001:db8::/32
+2002::/16
+fc00::/7
+fe80::/10
+ff00::/8
+"
+
 # Resolver that client IPv4 DNS (udp/53) is redirected to.
 DNS_V4=1.1.1.1
 
@@ -25,6 +59,7 @@ CHAIN_DNS6=VPNGW_DNS6        # ip6tables filter INPUT/FORWARD
 PREF_LO=5000
 PREF_TUN_MAIN=5010
 PREF_TUN_SKIP=5020
+PREF_LAN=5025
 PREF_MARK=5030
 PREF_MARK_FAILCLOSED=5031    # IPv6 only
 PREF_END=6000
@@ -85,17 +120,23 @@ EOF
 function del_ip_rules() {
     local fam=$1 pref
 
-    for pref in $PREF_LO $PREF_TUN_MAIN $PREF_TUN_SKIP $PREF_MARK \
+    for pref in $PREF_LO $PREF_TUN_MAIN $PREF_TUN_SKIP $PREF_LAN $PREF_MARK \
                 $PREF_MARK_FAILCLOSED $PREF_END; do
         while $ip $fam rule del pref $pref 2>/dev/null; do :; done
     done
 }
 
 function add_ip_rules() {
-    local fam=$1 tun_table_index=$2 rule
+    local fam=$1 tun_table_index=$2 bypass=$3 rule cidr
 
     ip_rules_for $tun_table_index | while read -r rule; do
         $ip $fam rule add $rule
+    done
+
+    # Intranet destinations use the normal tables (all share one pref so
+    # del_ip_rules wipes them with a loop).
+    for cidr in $bypass; do
+        $ip $fam rule add to $cidr lookup main pref $PREF_LAN
     done
 
     # IPv6 fail-closed: marked packets that the tun table cannot route
@@ -109,14 +150,27 @@ function add_ip_rules() {
 # iptables / ip6tables
 
 # $1: iptables command ($ipt4 / $ipt6)   $2: client source ranges
+# $3: destinations to leave unmarked      $4: "dns" = mark udp/53 before bypass
 function setup_mark_chain() {
-    local ipt=$1 srcs=$2 src
+    local ipt=$1 srcs=$2 bypass=$3 dns=$4 src cidr
 
     # mangle PREROUTING: mark everything coming from clients
     $ipt -t mangle -N $CHAIN_MARK 2>/dev/null
     $ipt -t mangle -F $CHAIN_MARK
     $ipt -t mangle -A $CHAIN_MARK -i lo -j RETURN
     $ipt -t mangle -A $CHAIN_MARK -i $TUN_NAME -j RETURN
+    # IPv4 DNS is DNAT'd to $DNS_V4 later (nat runs after mangle, routing runs
+    # after nat), so it must be marked here even if the original resolver is a
+    # LAN address; otherwise the redirected query would leave unmarked.
+    if [[ "$dns" = "dns" ]]; then
+        for src in $srcs; do
+            $ipt -t mangle -A $CHAIN_MARK -s $src -p udp --dport 53 -j MARK --set-xmark $FWMARK/$FWMASK
+        done
+        $ipt -t mangle -A $CHAIN_MARK -p udp --dport 53 -m mark --mark $FWMARK/$FWMASK -j RETURN
+    fi
+    for cidr in $bypass; do
+        $ipt -t mangle -A $CHAIN_MARK -d $cidr -j RETURN
+    done
     for src in $srcs; do
         $ipt -t mangle -A $CHAIN_MARK -s $src -j MARK --set-xmark $FWMARK/$FWMASK
     done
@@ -198,15 +252,15 @@ function setup() {
     cleanup
 
     # IPv4
-    setup_mark_chain "$ipt4" "$SRC_V4"
+    setup_mark_chain "$ipt4" "$SRC_V4" "$LAN_BYPASS_V4" dns
     setup_dns_v4
-    add_ip_rules "" $tun_table_index
+    add_ip_rules "" $tun_table_index "$LAN_BYPASS_V4"
 
     # IPv6
     if [[ $IPV6 = 1 ]]; then
-        setup_mark_chain "$ipt6" "$SRC_V6"
+        setup_mark_chain "$ipt6" "$SRC_V6" "$LAN_BYPASS_V6"
         setup_dns_block_v6
-        add_ip_rules "-6" $tun_table_index
+        add_ip_rules "-6" $tun_table_index "$LAN_BYPASS_V6"
     fi
 }
 
